@@ -11,3 +11,17 @@
 *_inputs.h
 *_settings.h
 *_RunMacro.C
+
+# Track the working JetSpectrum configuration in this fork.
+!Jets/JetSpectrum_inputs.h
+!Jets/JetSpectrum_settings.h
+!Jets/JetSpectrum_RunMacro.C
+
+# Generated analysis output and ROOT compilation caches.
+pdfFolder/
+pngFolder/
+epsFolder/
+outputs/
+*.root
+*.pcm
+*.o

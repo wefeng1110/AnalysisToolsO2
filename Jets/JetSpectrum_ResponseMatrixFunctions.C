@@ -553,6 +553,11 @@ void Get_PtResponseMatrix_detectorResponse(TH2D* &H2D_jetPtResponseMatrix_detect
   if (showFunctionInAndOutLog) {cout << "--- OUT Get_PtResponseMatrix_detectorResponse()" << endl;};
 }
 
+// Existing callers use the random-cone choice from JetSpectrum_settings.h.
+void Get_PtResponseMatrix_Fluctuations(TH2D* &matrix, int iDataset, int iRadius, std::string options) {
+  Get_PtResponseMatrix_Fluctuations(matrix, randomConeType, iDataset, iRadius, options);
+}
+
 void Get_PtResponseMatrix_Fluctuations(TH2D* &H2D_jetPtResponseMatrix_fluctuations, int randomConeTypeInput, int iDataset, int iRadius, std::string optionsFluctResp) { 
   if (showFunctionInAndOutLog) {cout << "--- IN  Get_PtResponseMatrix_Fluctuations()" << endl;};
 

@@ -1,3 +1,7 @@
+#if defined(__CLING__)
+R__LOAD_LIBRARY(libRooUnfold)
+#endif
+
 #include "TStyle.h"
 #include "TFile.h"
 #include "TFitResult.h"
@@ -42,6 +46,10 @@
 #include "../Utilities/HistogramPlotting.C" 
 
 #include<array>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <stdexcept>
 #include <iomanip>
 #include <sstream>
 #include <string.h>
@@ -53,14 +61,17 @@ void LoadLibs_Systematics();
 
 
 
-void Get_systematics_UnfoldMethod(TH1D* &hSystematicUncertainty, TH1D* &hSystematicUncertainty_PreBarlow, int iDataset, int iRadius, char** unfoldingMethodList, int* unfoldParameterInputList, int nUnfoldingMethods, std::string options);
-void Draw_Systematics_UnfoldMethod(int iDataset, int iRadius, char** unfoldingMethodList, int* unfoldParameterInputList, int nUnfoldingMethods, std::string options);
+void Get_systematics_UnfoldMethod(TH1D* &uncertainty, TH1D* &preBarlow, int iDataset, int iRadius, const char* const* methods, const int* parameters, int nMethods, std::string options, TH1D** reference = nullptr);
+void Draw_Systematics_UnfoldMethod(int iDataset, int iRadius, const char* const* methods, const int* parameters, int nMethods, std::string options);
+void Get_systematics_SvdParameter(TH1D* &uncertainty, TH1D* &preBarlow, int iDataset, int iRadius, int nominalK, std::string options, TH1D** reference = nullptr);
+void Draw_Systematics_SvdParameter(int iDataset, int iRadius, int nominalK, std::string options);
 
 /////////////////////////////////////////////////////
 ///////////////////// Main Macro ////////////////////
 /////////////////////////////////////////////////////
 
 void JetSpectrum_systematics() {
+  cout << "Apply Barlow test: " << (applyBarlowTest ? "true" : "false") << endl;
   // Load necessary libraries
   LoadLibs_Systematics();
   // Set the default style
@@ -82,10 +93,11 @@ void JetSpectrum_systematics() {
 
 
   const int nUnfoldingMethods = 2;
-  char* unfoldingMethodList[nUnfoldingMethods] = {"Svd", "Bayes"}; // default is the first one in this list
-  int unfoldParameterInputList[2] = {8, 10};
+  const char* unfoldingMethodList[nUnfoldingMethods] = {"Svd", "Bayes"}; // default is the first one in this list
+  int unfoldParameterInputList[2] = {11, 7};
 
   Draw_Systematics_UnfoldMethod(iDataset, iRadius, unfoldingMethodList, unfoldParameterInputList, nUnfoldingMethods, optionsAnalysis_withoutUnfoldingMethod);
+  Draw_Systematics_SvdParameter(iDataset, iRadius, unfoldParameterInputList[0], optionsAnalysis_withoutUnfoldingMethod);
 }
 
 /////////////////////////////////////////////////////
@@ -150,126 +162,170 @@ void SetStyle_Systematics(Bool_t graypalette) {
 }
 
 
-void Get_systematics_UnfoldMethod(TH1D* &hSystematicUncertainty, TH1D* &hSystematicUncertainty_PreBarlow, int iDataset, int iRadius, char** unfoldingMethodList, int* unfoldParameterInputList, int nUnfoldingMethods, std::string options) {
-
-  TH1D* hTempSystematicUncertainty = new TH1D("hTempSystematicUncertainty", "hTempSystematicUncertainty", nBinPtJetsGen[iRadius], ptBinsJetsGen[iRadius]);
-  TH1D* hTempSystematicUncertainty_PreBarlow = new TH1D("hTempSystematicUncertainty_PreBarlow", "hTempSystematicUncertainty_PreBarlow", nBinPtJetsGen[iRadius], ptBinsJetsGen[iRadius]);
-  hTempSystematicUncertainty->Sumw2();
-  hTempSystematicUncertainty_PreBarlow->Sumw2();
-  hTempSystematicUncertainty->Reset("M");
-  hTempSystematicUncertainty_PreBarlow->Reset("M");
-  TString partialUniqueSpecifier = Datasets[iDataset]+"_R="+Form("%.1f",arrayRadius[iRadius]);
-
-  // return histogram that has the systematics in its contents
-  TH1D* H1D_jetPt_unfolded[nUnfoldingMethods];
-  TH1D* H1D_jetPt_unfolded_differences[nUnfoldingMethods-1];
-
-
-  TH1D* measuredInput;
-  if (!normGenAndMeasByNEvtsForUnfoldingInput) {
-    Get_Pt_spectrum_bkgCorrected_recBinning_preWidthScalingAtEndAndEvtNorm(measuredInput, iDataset, iRadius, options); 
-    if (useFineBinningTest) {
-      Get_Pt_spectrum_bkgCorrected_fineBinning_preWidthScalingAtEndAndEvtNorm(measuredInput, iDataset, iRadius, options);
-    }
-  } else{
-    Get_Pt_spectrum_bkgCorrected_recBinning_preWidthScalingAtEnd(measuredInput, iDataset, iRadius, options);
-    if (useFineBinningTest) {
-      Get_Pt_spectrum_bkgCorrected_fineBinning_preWidthScalingAtEnd(measuredInput, iDataset, iRadius, options);
-    }
+// First spectrum is nominal. Use the largest absolute variation in each bin.
+// When Barlow is enabled, test each variation before taking the accepted envelope.
+void Get_Systematics_Envelope(TH1D* &uncertainty, TH1D* &preBarlow,
+                              const std::vector<TH1D*>& spectra, TString name) {
+  uncertainty = (TH1D*)spectra[0]->Clone("hSystematicUncertainty_" + name);
+  uncertainty->Reset("ICES");
+  preBarlow = nullptr;
+  if (applyBarlowTest) {
+    preBarlow = (TH1D*)uncertainty->Clone("hSystematicUncertainty_PreBarlow_" + name);
   }
 
-  char optionsAnalysis_withUnfoldingMethod[100] = "";
-  for(int iMethod = 0; iMethod < nUnfoldingMethods; iMethod++){
-    snprintf(optionsAnalysis_withUnfoldingMethod, sizeof(optionsAnalysis_withUnfoldingMethod), "%s,%s", options.c_str(), (const char*)unfoldingMethodList[iMethod]);
-    Get_Pt_spectrum_unfolded(H1D_jetPt_unfolded[iMethod], measuredInput, iDataset, iRadius, unfoldParameterInputList[iMethod], optionsAnalysis_withUnfoldingMethod);
-
-    if (iMethod != 0) {
-      H1D_jetPt_unfolded_differences[iMethod-1] = (TH1D*)H1D_jetPt_unfolded[iMethod]->Clone("H1D_jetPt_unfolded_differences"+partialUniqueSpecifier);
-      H1D_jetPt_unfolded_differences[iMethod-1]->Add(H1D_jetPt_unfolded[0],-1);
-    }
-    cout << "do I want the absolute value of the difference?" << endl;
-  }
-
-  // cout << "Do I apply Barlow condition even though not param variation ? check paper again" << endl; YES, the subset of data thing is only shown for first demonstration, but barlow says it holds true even if that's not the cast
-
-  /////////////////
-  // Barlow test //
-  /////////////////
-
-  TH1D* H1D_jetPt_unfolded_REF = H1D_jetPt_unfolded[0];
-  double SystUncertainty;
-  int id_SignalExtractionType_maxDeviation;
-  double hSigmaBarlow[nBinPtJetsGen[iRadius]];
-  for(int iBinPt = 1; iBinPt <= nBinPtJetsGen[iRadius]; iBinPt++){
-    SystUncertainty = 0;
-    for(int iMethod = 1; iMethod < nUnfoldingMethods; iMethod++){ // get maximum difference among the nUnfoldingMethods-1 ones, hold value with SystUncertainty, and the id of the method wîth id_SignalExtractionType_maxDeviation
-      if (abs(H1D_jetPt_unfolded_differences[iMethod-1]->GetBinContent(iBinPt)) > SystUncertainty) {
-        SystUncertainty = abs(H1D_jetPt_unfolded_differences[iMethod-1]->GetBinContent(iBinPt));
-        id_SignalExtractionType_maxDeviation = iMethod;
+  for (int bin = 1; bin <= spectra[0]->GetNbinsX(); ++bin) {
+    double maximum = 0., acceptedMaximum = 0.;
+    double maximumSigma = 0., acceptedSigma = 0.;
+    for (size_t variation = 1; variation < spectra.size(); ++variation) {
+      double difference = std::abs(spectra[variation]->GetBinContent(bin)
+                                   - spectra[0]->GetBinContent(bin));
+      if (!std::isfinite(difference)) throw std::runtime_error("Non-finite systematic variation");
+      if (!applyBarlowTest) {
+        maximum = std::max(maximum, difference);
+        continue; // No Barlow error calculation or threshold test.
+      }
+      double error = spectra[variation]->GetBinError(bin);
+      double referenceError = spectra[0]->GetBinError(bin);
+      double sigma = std::sqrt(std::abs(error*error - referenceError*referenceError));
+      if (!std::isfinite(sigma)) throw std::runtime_error("Non-finite Barlow uncertainty");
+      if (difference > maximum) {
+        maximum = difference;
+        maximumSigma = sigma;
+      }
+      if (difference > N_SigmaBarlow*sigma && difference > acceptedMaximum) {
+        acceptedMaximum = difference;
+        acceptedSigma = sigma;
       }
     }
-
-    // Barlow condition for systematics (Systematic Errors: facts and fictions, by Roger Barlow, https://arxiv.org/abs/hep-ex/0207026)
-    Double_t StatUncertainty_REF = H1D_jetPt_unfolded_REF->GetBinError(iBinPt);
-    Double_t StatUncertainty_MaxDeviationCase = H1D_jetPt_unfolded[id_SignalExtractionType_maxDeviation]->GetBinError(iBinPt);
- 
-    int PtArrayIterator = iBinPt - 1;
-    hSigmaBarlow[PtArrayIterator] = sqrt(abs(StatUncertainty_MaxDeviationCase*StatUncertainty_MaxDeviationCase - StatUncertainty_REF*StatUncertainty_REF)); //stat error of the difference in the case of subsample
- 
-    hTempSystematicUncertainty_PreBarlow->SetBinContent(iBinPt,SystUncertainty);
-    hTempSystematicUncertainty_PreBarlow->SetBinError(iBinPt,hSigmaBarlow[PtArrayIterator]);
-
-    if (SystUncertainty > N_SigmaBarlow*hSigmaBarlow[PtArrayIterator]) { //Could ask for 1Sigma, 4Sigma or whatever depending on how conservative we want to be; one suggested in PWGLF note is 2Sigma
-      hTempSystematicUncertainty->SetBinContent(iBinPt,SystUncertainty);
-      hTempSystematicUncertainty->SetBinError(iBinPt,hSigmaBarlow[PtArrayIterator]);
-    }
-    else {
-      hTempSystematicUncertainty->SetBinContent(iBinPt,0.);
+    uncertainty->SetBinContent(bin, applyBarlowTest ? acceptedMaximum : maximum);
+    uncertainty->SetBinError(bin, applyBarlowTest ? acceptedSigma : 0.);
+    if (applyBarlowTest) {
+      preBarlow->SetBinContent(bin, maximum);
+      preBarlow->SetBinError(bin, maximumSigma);
     }
   }
-
-  hSystematicUncertainty = (TH1D*)hTempSystematicUncertainty->Clone("hSystematicUncertainty_UnfoldMethod"+partialUniqueSpecifier);
-  hSystematicUncertainty_PreBarlow = (TH1D*)hTempSystematicUncertainty_PreBarlow->Clone("hSystematicUncertainty_PreBarlow_UnfoldMethod"+partialUniqueSpecifier);
-
 }
 
-
-
-void Draw_Systematics_UnfoldMethod(int iDataset, int iRadius, char** unfoldingMethodList, int* unfoldParameterInputList, int nUnfoldingMethods, std::string options) {
-
-  TH1D* hSystematicUncertainty;
-  TH1D* hSystematicUncertainty_PreBarlow;
-  Get_systematics_UnfoldMethod(hSystematicUncertainty, hSystematicUncertainty_PreBarlow, iDataset, iRadius, unfoldingMethodList, unfoldParameterInputList, nUnfoldingMethods, options);
-
-  TH1D* H1D_jetPt_unfolded;
-  char optionsAnalysis_withUnfoldingMethod[100] = "";
-  snprintf(optionsAnalysis_withUnfoldingMethod, sizeof(optionsAnalysis_withUnfoldingMethod), "%s,%s", options.c_str(), (const char*)unfoldingMethod);
-
-  TH1D* measuredInput;
+TH1D* Get_Systematics_MeasuredInput(int iDataset, int iRadius, std::string options) {
+  TH1D* measured = nullptr;
   if (!normGenAndMeasByNEvtsForUnfoldingInput) {
-    Get_Pt_spectrum_bkgCorrected_recBinning_preWidthScalingAtEndAndEvtNorm(measuredInput, iDataset, iRadius, options); 
-    if (useFineBinningTest) {
-      Get_Pt_spectrum_bkgCorrected_fineBinning_preWidthScalingAtEndAndEvtNorm(measuredInput, iDataset, iRadius, options);
-    }
-  } else{
-    Get_Pt_spectrum_bkgCorrected_recBinning_preWidthScalingAtEnd(measuredInput, iDataset, iRadius, options);
-    if (useFineBinningTest) {
-      Get_Pt_spectrum_bkgCorrected_fineBinning_preWidthScalingAtEnd(measuredInput, iDataset, iRadius, options);
-    }
+    if (useFineBinningTest)
+      Get_Pt_spectrum_bkgCorrected_fineBinning_preWidthScalingAtEndAndEvtNorm(measured, iDataset, iRadius, options);
+    else
+      Get_Pt_spectrum_bkgCorrected_recBinning_preWidthScalingAtEndAndEvtNorm(measured, iDataset, iRadius, options);
+  } else {
+    if (useFineBinningTest)
+      Get_Pt_spectrum_bkgCorrected_fineBinning_preWidthScalingAtEnd(measured, iDataset, iRadius, options);
+    else
+      Get_Pt_spectrum_bkgCorrected_recBinning_preWidthScalingAtEnd(measured, iDataset, iRadius, options);
   }
-  
-  Get_Pt_spectrum_unfolded(H1D_jetPt_unfolded, measuredInput, iDataset, iRadius, unfoldParameterInputList[0], optionsAnalysis_withUnfoldingMethod);
-  hSystematicUncertainty->Divide(H1D_jetPt_unfolded); //get it as a ratio of ref corrected yield
-  hSystematicUncertainty_PreBarlow->Divide(H1D_jetPt_unfolded); //get it as a ratio of ref corrected yield
+  return measured;
+}
 
+void Draw_Systematics_Spectra(std::vector<TH1D*>& spectra, const std::vector<TString>& legends,
+                             TString name, int iRadius) {
+  TString* pdfName = new TString(name);
+  TString* yTitle = normaliseUnfoldingResultsAtEnd
+    ? texJet_d2Ndptdeta_EventNorm
+    : new TString("d^{2}#it{N}_{jet}/d#it{p}_{T}d#it{#eta} (GeV/#it{c})^{-1}");
+  std::array<std::array<float, 2>, 2> legendPlacement = {{{0.53, 0.59}, {0.94, 0.79}}};
+  Draw_TH1_Histograms(spectra.data(), legends.data(), spectra.size(),
+                     contextJetRadius(arrayRadius[iRadius]), pdfName, texPtJetGen, yTitle,
+                     texCollisionDataInfo, drawnWindowUnfoldedMeasurement,
+                     legendPlacement, contextPlacementAuto, "logy");
+}
 
-  TString partialUniqueSpecifier = Datasets[iDataset]+"_R="+Form("%.1f",arrayRadius[iRadius])+"]_"+unfoldingMethodList[0]+"_kUnfold="+Form("%i", unfoldParameterInputList[0]);
+// Convert the absolute envelope to a fraction of the nominal spectrum.
+// No independent ratio-error propagation: nominal and variations share the data.
+void Draw_Systematics_RelativeUncertainty(TH1D* uncertainty, TH1D* preBarlow,
+                                         TH1D* reference, TString name, int iRadius) {
+  TH1D* histograms[2] = {uncertainty, preBarlow};
+  int nHistograms = applyBarlowTest ? 2 : 1;
+  for (int h = 0; h < nHistograms; ++h) {
+    for (int bin = 1; bin <= reference->GetNbinsX(); ++bin) {
+      double denominator = std::abs(reference->GetBinContent(bin));
+      if (!std::isfinite(denominator)) throw std::runtime_error("Non-finite nominal spectrum");
+      if (denominator == 0.) {
+        if (histograms[h]->GetBinContent(bin) != 0.)
+          throw std::runtime_error("Cannot form relative uncertainty with zero nominal yield");
+        histograms[h]->SetBinContent(bin, 0.);
+        histograms[h]->SetBinError(bin, 0.);
+      } else {
+        histograms[h]->SetBinContent(bin, histograms[h]->GetBinContent(bin)/denominator);
+        histograms[h]->SetBinError(bin, histograms[h]->GetBinError(bin)/denominator);
+      }
+    }
+    TString suffix = !applyBarlowTest ? "_NoBarlow" : (h == 0 ? "_Barlow" : "_PreBarlow");
+    TString* pdfName = new TString(name + suffix);
+    TString* yTitle = new TString("Relative systematic uncertainty");
+    Draw_TH1_Histogram(histograms[h], contextJetRadius(arrayRadius[iRadius]), pdfName,
+                       texPtJetGen, yTitle, texCollisionDataInfo, drawnWindowUnfoldedMeasurement,
+                       legendPlacementAuto, contextPlacementAuto, "");
+    cout << name << suffix << ": relative maximum = " << histograms[h]->GetMaximum() << endl;
+  }
+}
 
-  TString* pdfName = new TString("Systematics_UnfoldMethod_"+partialUniqueSpecifier);
-  TString* pdfName_PreBarlow = new TString("Systematics_UnfoldMethod_"+partialUniqueSpecifier+"_PreBarlow");
+void Get_systematics_UnfoldMethod(TH1D* &uncertainty, TH1D* &preBarlow, int iDataset, int iRadius,
+                                  const char* const* methods, const int* parameters, int nMethods,
+                                  std::string options, TH1D** reference) {
+  if (nMethods < 2) throw std::runtime_error("At least two unfolding methods are required");
+  TH1D* measured = Get_Systematics_MeasuredInput(iDataset, iRadius, options);
+  std::vector<TH1D*> spectra(nMethods);
+  std::vector<TString> legends(nMethods);
+  TString name = "UnfoldMethod_" + Datasets[iDataset] + Form("_R=%.1f", arrayRadius[iRadius]);
+  for (int method = 0; method < nMethods; ++method) {
+    Get_Pt_spectrum_unfolded(spectra[method], measured, iDataset, iRadius, parameters[method],
+                             options + "," + methods[method]);
+    legends[method] = TString(methods[method]) == "Svd"
+      ? Form("SVD, k = %d", parameters[method])
+      : Form("%s, iter. = %d", methods[method], parameters[method]);
+    name += Form("_%s%d", methods[method], parameters[method]);
+  }
+  Get_Systematics_Envelope(uncertainty, preBarlow, spectra, name);
+  Draw_Systematics_Spectra(spectra, legends, "Systematics_Spectra_" + name, iRadius);
+  if (reference) *reference = spectra[0];
+}
 
-  TString textContext("");
+void Draw_Systematics_UnfoldMethod(int iDataset, int iRadius, const char* const* methods,
+                                   const int* parameters, int nMethods, std::string options) {
+  TH1D *uncertainty, *preBarlow, *reference;
+  Get_systematics_UnfoldMethod(uncertainty, preBarlow, iDataset, iRadius, methods, parameters,
+                               nMethods, options, &reference);
+  TString name = "Systematics_UnfoldMethod_" + Datasets[iDataset]
+                 + Form("_R=%.1f", arrayRadius[iRadius]);
+  for (int method = 0; method < nMethods; ++method)
+    name += Form("_%s%d", methods[method], parameters[method]);
+  Draw_Systematics_RelativeUncertainty(uncertainty, preBarlow, reference, name, iRadius);
+}
 
-  Draw_TH1_Histogram(hSystematicUncertainty, textContext, pdfName, texPtJetRec, texSystematicsPercent, texCollisionDataInfo, drawnWindowAuto, legendPlacementAuto, contextPlacementAuto, "");
-  Draw_TH1_Histogram(hSystematicUncertainty_PreBarlow, textContext, pdfName_PreBarlow, texPtJetRec, texSystematicsPercent, texCollisionDataInfo, drawnWindowAuto, legendPlacementAuto, contextPlacementAuto, "");
+void Get_systematics_SvdParameter(TH1D* &uncertainty, TH1D* &preBarlow, int iDataset,
+                                 int iRadius, int nominalK, std::string options, TH1D** reference) {
+  if (automaticBestSvdParameter)
+    throw std::runtime_error("Disable automaticBestSvdParameter for an explicit k variation");
+  int nBins = useFineBinningTest ? nBinPtJetsFine[iRadius]
+                               : std::min(nBinPtJetsRec[iRadius], nBinPtJetsGen[iRadius]);
+  if (nominalK < 2 || nominalK + 1 > nBins)
+    throw std::runtime_error("SVD k-1 and k+1 must lie within the response bin count");
+  TH1D* measured = Get_Systematics_MeasuredInput(iDataset, iRadius, options);
+  const int parameters[3] = {nominalK, nominalK - 1, nominalK + 1};
+  std::vector<TH1D*> spectra(3);
+  std::vector<TString> legends(3);
+  TString name = "SvdParameter_" + Datasets[iDataset]
+                 + Form("_R=%.1f_k%d", arrayRadius[iRadius], nominalK);
+  for (int variation = 0; variation < 3; ++variation) {
+    Get_Pt_spectrum_unfolded(spectra[variation], measured, iDataset, iRadius, parameters[variation],
+                             options + ",Svd");
+    legends[variation] = Form("SVD, k = %d%s", parameters[variation], variation == 0 ? " (nominal)" : "");
+  }
+  Get_Systematics_Envelope(uncertainty, preBarlow, spectra, name);
+  Draw_Systematics_Spectra(spectra, legends, "Systematics_Spectra_" + name, iRadius);
+  if (reference) *reference = spectra[0];
+}
+
+void Draw_Systematics_SvdParameter(int iDataset, int iRadius, int nominalK, std::string options) {
+  TH1D *uncertainty, *preBarlow, *reference;
+  Get_systematics_SvdParameter(uncertainty, preBarlow, iDataset, iRadius, nominalK, options, &reference);
+  TString name = "Systematics_SvdParameter_" + Datasets[iDataset]
+                 + Form("_R=%.1f_k%d", arrayRadius[iRadius], nominalK);
+  Draw_Systematics_RelativeUncertainty(uncertainty, preBarlow, reference, name, iRadius);
 }
